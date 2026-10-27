@@ -10,8 +10,8 @@ if [[ $(uname) != Linux ]]; then
   echo "tmp-janitor needs Linux with systemd" >&2
   exit 1
 fi
-if ! python3 -c 'import tomllib' 2>/dev/null; then
-  echo "tmp-janitor needs Python 3.11 or later" >&2
+if ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 12))' 2>/dev/null; then
+  echo "tmp-janitor needs Python 3.12 or later" >&2
   exit 1
 fi
 
