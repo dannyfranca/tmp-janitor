@@ -1,0 +1,8 @@
+[Unit]
+Description=Scheduled check of temp dir usage
+
+[Timer]
+@ON_CALENDAR@
+
+[Install]
+WantedBy=timers.target

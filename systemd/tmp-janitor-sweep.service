@@ -1,0 +1,11 @@
+[Unit]
+Description=Remove idle entries from temp dirs
+Documentation=https://github.com/dannyfranca/tmp-janitor
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/tmp-janitor sweep
+# Large build dirs can take long to remove; background priority keeps the desktop responsive.
+TimeoutStartSec=infinity
+Nice=10
+IOSchedulingClass=idle
