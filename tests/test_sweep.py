@@ -1,11 +1,13 @@
 import os
+import shutil
 import socket
 import stat
 import subprocess
+import sys
 import time
 import unittest
 
-from support import JanitorTestCase
+from support import SCRIPT, JanitorTestCase
 
 
 IDLE_SECONDS = 3600
@@ -87,6 +89,69 @@ idle = "1h"
             self.run_janitor("sweep")
             self.assertTrue(tree.exists())
             self.assertEqual(handle.read(), "data")
+
+    def test_keeps_entry_with_a_running_executable(self):
+        tree = self.make_tree("bin")
+        executable = tree / "nested" / "sleep"
+        shutil.copy2(shutil.which("sleep"), executable)
+        process = subprocess.Popen([executable, "30"], cwd=self.root)
+        self.addCleanup(process.wait)
+        self.addCleanup(process.kill)
+        self.run_janitor("sweep")
+        self.assertTrue(tree.exists())
+
+    def test_keeps_entry_with_a_mapped_file_after_its_fd_closes(self):
+        tree = self.make_tree("mapped")
+        # Python mmap keeps its own copy of the fd, so only a raw mmap call leaves the map without an fd.
+        code = (
+            "import ctypes, os, sys, time\n"
+            "libc = ctypes.CDLL(None, use_errno=True)\n"
+            "libc.mmap.restype = ctypes.c_void_p\n"
+            "libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_long]\n"
+            "fd = os.open(sys.argv[1], os.O_RDONLY)\n"
+            "assert libc.mmap(None, 4, 1, 2, fd, 0) not in (None, ctypes.c_void_p(-1).value)\n"
+            "os.close(fd)\n"
+            "print('ready', flush=True)\n"
+            "time.sleep(30)\n"
+        )
+        process = subprocess.Popen(
+            [sys.executable, "-c", code, tree / "nested" / "file"], cwd=self.root, stdout=subprocess.PIPE, text=True
+        )
+        self.addCleanup(process.wait)
+        self.addCleanup(process.kill)
+        self.addCleanup(process.stdout.close)
+        self.assertEqual(process.stdout.readline(), "ready\n")
+        self.run_janitor("sweep")
+        self.assertTrue(tree.exists())
+
+    def test_keeps_entry_with_a_recent_status_change(self):
+        tree = self.make_tree("extracted")
+        old = time.time() - 7 * 86400
+        for path in (tree / "nested" / "file", tree / "nested", tree):
+            os.utime(path, (old, old))
+        self.env["TMP_JANITOR_NOW"] = str(time.time() + IDLE_SECONDS / 2)
+        self.run_janitor("sweep")
+        self.assertTrue(tree.exists())
+
+    def test_keeps_entry_that_contains_a_mount(self):
+        unshare = ["unshare", "--user", "--map-root-user", "--mount"]
+        probe = subprocess.run([*unshare, "mount", "--bind", self.root, self.root], capture_output=True, timeout=30)
+        if probe.returncode != 0:
+            self.skipTest("needs a user namespace that can mount")
+        tree = self.make_tree("mounted")
+        source = self.outside / "persistent"
+        source.mkdir()
+        (source / "data").write_text("data")
+        mount_point = tree / "nested" / "mount"
+        mount_point.mkdir()
+        result = subprocess.run(
+            [*unshare, "sh", "-c", 'mount --bind "$1" "$2" && exec "$3" "$4" sweep', "sh",
+             source, mount_point, sys.executable, SCRIPT],
+            env=self.env, capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"kept {tree}: contains a mount", result.stdout)
+        self.assertTrue((source / "data").exists())
 
     def test_keeps_runtime_dirs_and_sockets(self):
         runtime = self.target / "runtime"

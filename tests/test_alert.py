@@ -77,6 +77,13 @@ percent = {percent}
         result = self.run_janitor("alert", expected_status=1)
         self.assertIn("could not send notification", result.stderr)
 
+    def test_succeeds_when_the_notification_id_cannot_be_saved(self):
+        self.use_percent(0.0001)
+        self.env["XDG_STATE_HOME"] = str(self.watched / "big")
+        result = self.run_janitor("alert")
+        self.assertIn("could not save notification id", result.stderr)
+        self.assertEqual(len(self.notifications()), 1)
+
     def test_needs_an_alert_section(self):
         self.write_config(
             f'[sweep]\nschedule = "daily"\n[[sweep.dirs]]\npath = "{self.watched}"\nidle = "1d"\n'
