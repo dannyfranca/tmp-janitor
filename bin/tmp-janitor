@@ -265,11 +265,8 @@ def unescape_mount_path(path):
 
 def mount_points():
     # Bind mounts can show a dir of the same file system, so only mountinfo finds all of them.
-    try:
-        with open("/proc/self/mountinfo") as mountinfo:
-            return {unescape_mount_path(line.split()[4]) for line in mountinfo}
-    except OSError:
-        return set()
+    with open("/proc/self/mountinfo") as mountinfo:
+        return {unescape_mount_path(line.split()[4]) for line in mountinfo}
 
 
 def in_use(path, used):
@@ -353,7 +350,13 @@ def sweep(config, dry_run):
                 print(f"kept {path}: changed during the sweep")
                 continue
             # rmtree follows mounts, so a mount in an entry would lose the data of the mounted file system.
-            if in_use(path, mount_points()):
+            try:
+                mounts = mount_points()
+            except OSError as error:
+                print(f"kept {path}: could not read the mounts: {error}", file=sys.stderr)
+                failures += 1
+                continue
+            if in_use(path, mounts):
                 print(f"kept {path}: contains a mount")
                 continue
             if in_use(path, paths_in_use()):
