@@ -386,9 +386,15 @@ def sweep(config, dry_run):
 
 def largest_entries(path, count):
     sizes = []
+    # A mount uses no space of the alert file system, for example the FUSE mount of an AppImage.
     try:
+        device = os.stat(path).st_dev
         with os.scandir(path) as entries:
-            sizes = [(tree_size(entry.path), entry.name) for entry in entries]
+            sizes = [
+                (tree_size(entry.path), entry.name)
+                for entry in entries
+                if entry.stat(follow_symlinks=False).st_dev == device
+            ]
     except OSError:
         pass
     return sorted(sizes, reverse=True)[:count]

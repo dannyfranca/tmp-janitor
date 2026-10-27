@@ -1,9 +1,10 @@
 import json
 import shlex
+import subprocess
 import sys
 import unittest
 
-from support import JanitorTestCase
+from support import SCRIPT, JanitorTestCase
 
 
 class AlertTests(JanitorTestCase):
@@ -83,6 +84,22 @@ percent = {percent}
         result = self.run_janitor("alert")
         self.assertIn("could not save notification id", result.stderr)
         self.assertEqual(len(self.notifications()), 1)
+
+    def test_lists_only_entries_of_the_alert_file_system(self):
+        unshare = ["unshare", "--user", "--map-root-user", "--mount"]
+        probe = subprocess.run([*unshare, "mount", "-t", "tmpfs", "none", self.root], capture_output=True, timeout=30)
+        if probe.returncode != 0:
+            self.skipTest("needs a user namespace that can mount")
+        self.use_percent(0.0001)
+        (self.watched / "mounted").mkdir()
+        command = 'mount -t tmpfs none "$1" && head -c 1048576 /dev/zero > "$1/huge" && exec "$2" "$3" alert'
+        result = subprocess.run(
+            [*unshare, "sh", "-c", command, "sh", self.watched / "mounted", sys.executable, SCRIPT],
+            env=self.env, capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("big (", result.stdout)
+        self.assertNotIn("mounted", result.stdout)
 
     def test_needs_an_alert_section(self):
         self.write_config(
