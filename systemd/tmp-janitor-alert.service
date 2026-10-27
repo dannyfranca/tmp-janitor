@@ -1,0 +1,7 @@
+[Unit]
+Description=Alert when a temp dir is almost full
+Documentation=https://github.com/dannyfranca/tmp-janitor
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/tmp-janitor alert

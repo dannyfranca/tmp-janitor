@@ -1,0 +1,10 @@
+[Unit]
+Description=Scheduled sweep of idle temp dir entries
+
+[Timer]
+@ON_CALENDAR@
+# A missed run must wait for the user manager, which usually starts at login.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
