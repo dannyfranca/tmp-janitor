@@ -305,6 +305,8 @@ def remove(path):
 def stale_entries(sweep_dir, keep, current_time):
     cutoff = current_time - sweep_dir.idle
     uid = os.getuid()
+    # A mounted file system can be large or slow, so the age walk must not enter it.
+    mounts = mount_points()
     with os.scandir(sweep_dir.path) as entries:
         for entry in sorted(entries, key=lambda item: item.name):
             if any(fnmatch.fnmatchcase(entry.name, pattern) for pattern in keep):
@@ -315,6 +317,9 @@ def stale_entries(sweep_dir, keep, current_time):
                 continue
             kind = stat.S_IFMT(info.st_mode)
             if info.st_uid != uid or kind not in (stat.S_IFDIR, stat.S_IFREG, stat.S_IFLNK):
+                continue
+            if in_use(entry.path, mounts):
+                print(f"kept {entry.path}: contains a mount")
                 continue
             changed = last_change(entry.path, cutoff)
             if changed < cutoff:
