@@ -1,0 +1,43 @@
+# tmp-janitor config. The script reads this file at each run.
+# A schedule goes into the systemd timers. After you change a schedule, run ./install.sh again.
+
+[sweep]
+# systemd OnCalendar expression, or a list of them.
+# Examples: "daily", "hourly", "*-*-* 11:15", "Mon,Thu 03:00", ["06:00", "18:00"].
+schedule = "daily"
+
+# true: show what a sweep would remove, without removing it.
+dry_run = false
+
+# Top-level names that the sweep always keeps. Shell glob patterns.
+keep = [
+  "claude-*",
+  "codex-*",
+  "t3code-*",
+  "tmux-*",
+  "ssh-*",
+  ".X*",
+  ".ICE-unix",
+  "systemd-private-*",
+  ".mount_*",
+  "*chromium*",
+  "scoped_dir*",
+]
+
+# A dir to sweep. The sweep removes a top-level entry when nothing in it changed for the idle time.
+# Units: s, min, h, d, w. You can combine them, for example "1d12h".
+[[sweep.dirs]]
+path = "/tmp"
+idle = "24h"
+
+[[sweep.dirs]]
+path = "~/.cache/agent-tmp"
+idle = "7d"
+
+# Remove this section to turn off the alert.
+[alert]
+# systemd OnCalendar expression, or a list of them. "*:0/10" is every 10 minutes.
+schedule = "*:0/10"
+path = "/tmp"
+# Send a notification when the file system of path is this full, in percent.
+percent = 75

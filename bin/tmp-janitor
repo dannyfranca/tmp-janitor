@@ -1,0 +1,438 @@
+#!/usr/bin/env python3
+import argparse
+import fnmatch
+import math
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import time
+import tomllib
+from dataclasses import dataclass
+from pathlib import Path
+
+DURATION_PART = re.compile(r"(\d+)(s|min|h|d|w)")
+DURATION = re.compile(rf"(?:{DURATION_PART.pattern})+")
+DURATION_SECONDS = {"s": 1, "min": 60, "h": 3600, "d": 86400, "w": 604800}
+TOP_KEYS = {"sweep", "alert"}
+SWEEP_KEYS = {"schedule", "dry_run", "keep", "dirs"}
+DIR_KEYS = {"path", "idle"}
+ALERT_KEYS = {"schedule", "path", "percent"}
+
+
+class ConfigError(Exception):
+    pass
+
+
+@dataclass
+class SweepDir:
+    path: Path
+    idle: float
+
+
+@dataclass
+class Alert:
+    schedule: list[str]
+    path: Path
+    percent: float
+
+
+@dataclass
+class Config:
+    sweep_schedule: list[str]
+    dry_run: bool
+    keep: list[str]
+    dirs: list[SweepDir]
+    alert: Alert | None
+
+
+def config_path():
+    if "TMP_JANITOR_CONFIG" in os.environ:
+        return Path(os.environ["TMP_JANITOR_CONFIG"])
+    config_home = os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config"
+    return Path(config_home) / "tmp-janitor" / "config.toml"
+
+
+def state_dir():
+    state_home = os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state"
+    return Path(state_home) / "tmp-janitor"
+
+
+def check_keys(table, allowed, where):
+    unknown = sorted(set(table) - allowed)
+    if unknown:
+        raise ConfigError(f"unknown key in {where}: {', '.join(unknown)}")
+
+
+def require(table, key, kind, where):
+    if key not in table:
+        raise ConfigError(f"missing {where}.{key}")
+    value = table[key]
+    if not isinstance(value, kind) or (kind is int and isinstance(value, bool)):
+        raise ConfigError(f"{where}.{key} has the wrong type")
+    return value
+
+
+def parse_schedule(value, where):
+    schedule = [value] if isinstance(value, str) else value
+    if (
+        not isinstance(schedule, list)
+        or not schedule
+        or not all(isinstance(item, str) and item.strip() and "\n" not in item for item in schedule)
+    ):
+        raise ConfigError(f"{where}.schedule must be a calendar expression or a list of them")
+    return schedule
+
+
+def parse_duration(value, where):
+    if not isinstance(value, str) or not DURATION.fullmatch(value):
+        raise ConfigError(f"{where}.idle must be a duration such as 24h, 7d or 1d12h, got: {value!r}")
+    return sum(int(amount) * DURATION_SECONDS[unit] for amount, unit in DURATION_PART.findall(value))
+
+
+def parse_path(value, where):
+    if not isinstance(value, str) or not value:
+        raise ConfigError(f"{where}.path must be a path")
+    path = Path(os.path.expandvars(os.path.expanduser(value)))
+    if not path.is_absolute():
+        raise ConfigError(f"{where}.path must be absolute, got: {value}")
+    return path
+
+
+def load_config(path):
+    try:
+        with open(path, "rb") as file:
+            data = tomllib.load(file)
+    except FileNotFoundError:
+        raise ConfigError("file not found") from None
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise ConfigError(str(error)) from None
+
+    check_keys(data, TOP_KEYS, "the top level")
+    sweep = require(data, "sweep", dict, "config")
+    check_keys(sweep, SWEEP_KEYS, "[sweep]")
+    dry_run = sweep.get("dry_run", False)
+    if not isinstance(dry_run, bool):
+        raise ConfigError("sweep.dry_run must be true or false")
+    keep = sweep.get("keep", [])
+    if not isinstance(keep, list) or not all(isinstance(name, str) for name in keep):
+        raise ConfigError("sweep.keep must be a list of glob patterns")
+
+    dirs = []
+    for index, table in enumerate(require(sweep, "dirs", list, "sweep")):
+        where = f"sweep.dirs[{index}]"
+        if not isinstance(table, dict):
+            raise ConfigError(f"{where} must be a table")
+        check_keys(table, DIR_KEYS, where)
+        dirs.append(
+            SweepDir(
+                parse_path(require(table, "path", str, where), where),
+                parse_duration(require(table, "idle", str, where), where),
+            )
+        )
+
+    alert = None
+    if "alert" in data:
+        table = require(data, "alert", dict, "config")
+        check_keys(table, ALERT_KEYS, "[alert]")
+        percent = require(table, "percent", (int, float), "alert")
+        if isinstance(percent, bool) or not 0 < percent <= 100:
+            raise ConfigError("alert.percent must be a number above 0 and at most 100")
+        alert = Alert(
+            parse_schedule(require(table, "schedule", (str, list), "alert"), "alert"),
+            parse_path(require(table, "path", str, "alert"), "alert"),
+            percent,
+        )
+
+    return Config(
+        parse_schedule(require(sweep, "schedule", (str, list), "sweep"), "sweep"),
+        dry_run,
+        keep,
+        dirs,
+        alert,
+    )
+
+
+def human_size(size):
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if size < 1024:
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TiB"
+
+
+def human_age(seconds):
+    days, rest = divmod(int(seconds), 86400)
+    hours, rest = divmod(rest, 3600)
+    return f"{days}d {hours}h" if days else f"{hours}h {rest // 60}min"
+
+
+def now():
+    # Tests age entries by moving the clock, because no API can set a file's ctime.
+    return float(os.environ.get("TMP_JANITOR_NOW", time.time()))
+
+
+def last_change(path, cutoff):
+    # ctime counts as a change because archive tools keep old mtimes on files they just extracted.
+    # A socket marks a runtime dir: its server keeps it by path, and /proc does not show that path.
+    stack = [path]
+    newest = -math.inf
+    while stack:
+        current = stack.pop()
+        try:
+            info = os.lstat(current)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return math.inf
+        if stat.S_ISSOCK(info.st_mode):
+            return math.inf
+        newest = max(newest, info.st_mtime, info.st_ctime)
+        if newest >= cutoff:
+            return newest
+        if stat.S_ISDIR(info.st_mode):
+            try:
+                with os.scandir(current) as entries:
+                    stack.extend(entry.path for entry in entries)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return math.inf
+    return newest
+
+
+def tree_size(path):
+    total = 0
+    stack = [path]
+    while stack:
+        current = stack.pop()
+        try:
+            info = os.lstat(current)
+        except OSError:
+            continue
+        total += info.st_blocks * 512
+        if stat.S_ISDIR(info.st_mode):
+            try:
+                with os.scandir(current) as entries:
+                    stack.extend(entry.path for entry in entries)
+            except OSError:
+                continue
+    return total
+
+
+def strip_deleted(path):
+    return path.removesuffix(" (deleted)")
+
+
+def paths_in_use():
+    used = set()
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        process = f"/proc/{pid}"
+        for link in ("cwd", "exe"):
+            try:
+                used.add(strip_deleted(os.readlink(f"{process}/{link}")))
+            except OSError:
+                pass
+        try:
+            descriptors = os.listdir(f"{process}/fd")
+        except OSError:
+            continue
+        for descriptor in descriptors:
+            try:
+                target = os.readlink(f"{process}/fd/{descriptor}")
+            except OSError:
+                continue
+            if target.startswith("/"):
+                used.add(strip_deleted(target))
+        try:
+            with open(f"{process}/maps") as maps:
+                for line in maps:
+                    fields = line.rstrip("\n").split(maxsplit=5)
+                    if len(fields) == 6 and fields[5].startswith("/"):
+                        used.add(strip_deleted(fields[5]))
+        except OSError:
+            pass
+    return used
+
+
+def in_use(path, used):
+    prefix = path + "/"
+    return any(item == path or item.startswith(prefix) for item in used)
+
+
+def unlock_dirs(path):
+    # Go module caches are read-only, so removal needs write access to each dir first.
+    stack = [path]
+    while stack:
+        current = stack.pop()
+        try:
+            os.chmod(current, stat.S_IRWXU)
+            with os.scandir(current) as entries:
+                stack.extend(entry.path for entry in entries if entry.is_dir(follow_symlinks=False))
+        except OSError:
+            continue
+
+
+def remove(path):
+    errors = []
+    if os.path.isdir(path) and not os.path.islink(path):
+        unlock_dirs(path)
+        shutil.rmtree(path, onexc=lambda _function, item, error: errors.append(f"{item}: {error}"))
+    else:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            errors.append(f"{path}: {error}")
+    return errors
+
+
+def stale_entries(sweep_dir, keep, current_time):
+    cutoff = current_time - sweep_dir.idle
+    uid = os.getuid()
+    with os.scandir(sweep_dir.path) as entries:
+        for entry in sorted(entries, key=lambda item: item.name):
+            if any(fnmatch.fnmatchcase(entry.name, pattern) for pattern in keep):
+                continue
+            try:
+                info = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            kind = stat.S_IFMT(info.st_mode)
+            if info.st_uid != uid or kind not in (stat.S_IFDIR, stat.S_IFREG, stat.S_IFLNK):
+                continue
+            changed = last_change(entry.path, cutoff)
+            if changed < cutoff:
+                yield entry.path, current_time - changed
+
+
+def sweep(config, dry_run):
+    failures = 0
+    home = Path.home().resolve()
+    for sweep_dir in config.dirs:
+        root = sweep_dir.path.resolve()
+        if root == Path("/") or root == home:
+            print(f"skipped {sweep_dir.path}: refusing to sweep / or the home dir", file=sys.stderr)
+            failures += 1
+            continue
+        if not root.is_dir():
+            print(f"skipped {sweep_dir.path}: not a dir")
+            continue
+        try:
+            stale = list(stale_entries(SweepDir(root, sweep_dir.idle), config.keep, now()))
+        except OSError as error:
+            print(f"skipped {sweep_dir.path}: {error}", file=sys.stderr)
+            failures += 1
+            continue
+
+        # Read /proc after the slow tree walks, so the snapshot is as fresh as possible.
+        used = paths_in_use() if stale else set()
+        removed = 0
+        freed = 0
+        for path, idle in stale:
+            if in_use(path, used):
+                print(f"kept {path}: in use")
+                continue
+            size = tree_size(path)
+            if dry_run:
+                print(f"would remove {path} (idle {human_age(idle)}, {human_size(size)})")
+            else:
+                errors = remove(path)
+                for error in errors:
+                    print(f"could not remove {error}", file=sys.stderr)
+                if errors:
+                    failures += 1
+                    continue
+                print(f"removed {path} (idle {human_age(idle)}, {human_size(size)})")
+            removed += 1
+            freed += size
+        verb = "would remove" if dry_run else "removed"
+        print(f"{sweep_dir.path}: {verb} {removed} entries, {human_size(freed)}")
+    return 1 if failures else 0
+
+
+def largest_entries(path, count):
+    sizes = []
+    try:
+        with os.scandir(path) as entries:
+            sizes = [(tree_size(entry.path), entry.name) for entry in entries]
+    except OSError:
+        pass
+    return sorted(sizes, reverse=True)[:count]
+
+
+def notify(summary, body):
+    id_file = state_dir() / "notification-id"
+    command = ["notify-send", "--app-name=tmp-janitor", "--urgency=critical", "--print-id"]
+    # One notification that updates in place, because a critical one stays until dismissed and repeats would pile up.
+    try:
+        command += ["--replace-id", id_file.read_text().strip()]
+    except OSError:
+        pass
+    try:
+        result = subprocess.run([*command, summary, body], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        print(f"could not send notification: {error}", file=sys.stderr)
+        return False
+    if result.returncode != 0:
+        print(f"could not send notification: {result.stderr.strip()}", file=sys.stderr)
+        return False
+    notification_id = result.stdout.strip()
+    if notification_id.isdigit():
+        id_file.parent.mkdir(parents=True, exist_ok=True)
+        id_file.write_text(notification_id + "\n")
+    return True
+
+
+def alert(config):
+    if config.alert is None:
+        print("no [alert] section in the config", file=sys.stderr)
+        return 2
+    usage = shutil.disk_usage(config.alert.path)
+    percent = usage.used * 100 / usage.total
+    if percent < config.alert.percent:
+        return 0
+    summary = f"{config.alert.path} is {percent:.0f}% full"
+    largest = ", ".join(f"{name} ({human_size(size)})" for size, name in largest_entries(config.alert.path, 3))
+    body = f"{human_size(usage.used)} of {human_size(usage.total)} used. Largest: {largest or 'unknown'}"
+    print(f"{summary}. {body}")
+    return 0 if notify(summary, body) else 1
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="tmp-janitor",
+        description="Remove idle entries from temp dirs, and alert when a temp dir is almost full.",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+    sweep_parser = commands.add_parser("sweep", help="remove idle top-level entries from the configured dirs")
+    sweep_parser.add_argument("-n", "--dry-run", action="store_true", help="show what a sweep would remove")
+    commands.add_parser("alert", help="send a notification when the alert path is too full")
+    schedule_parser = commands.add_parser("schedule", help="print the calendar expressions of a timer")
+    schedule_parser.add_argument("timer", choices=("sweep", "alert"))
+    args = parser.parse_args()
+
+    path = config_path()
+    try:
+        config = load_config(path)
+    except ConfigError as error:
+        print(f"tmp-janitor: config {path}: {error}", file=sys.stderr)
+        return 2
+
+    if args.command == "sweep":
+        return sweep(config, args.dry_run or config.dry_run)
+    if args.command == "alert":
+        return alert(config)
+    schedule = config.sweep_schedule if args.timer == "sweep" else config.alert.schedule if config.alert else []
+    for expression in schedule:
+        print(expression)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
