@@ -14,7 +14,7 @@ If you set `XDG_CONFIG_HOME`, `~/.config` in this README means that dir. Set the
 ## Requirements
 
 - Linux with systemd
-- Python 3.11 or later
+- Python 3.12 or later
 - `notify-send` (libnotify) for the alert
 
 ## Install
@@ -71,7 +71,7 @@ percent = 75
 | `alert.path` | The check uses the file system of this path. |
 | `alert.percent` | Send a notification when the file system is this full, in percent. |
 
-To use a different file, set `TMP_JANITOR_CONFIG`. If the file is missing, or has an unknown key or a value that is not valid, the command stops with exit code 2.
+To use a different file for a manual run, set `TMP_JANITOR_CONFIG`. The installer and the timers use only `~/.config/tmp-janitor/config.toml`. If the file is missing, or has an unknown key or a value that is not valid, the command stops with exit code 2.
 
 ### Sweep rules
 
@@ -80,10 +80,11 @@ The sweep examines each top-level entry in each dir. It keeps the entry if one o
 - The name matches a `keep` pattern.
 - A file or dir in the entry changed during the idle time. The sweep uses the newer of the modification time and the status change time, because archive tools keep old modification times on files that they extract.
 - The entry contains a socket. A socket shows a runtime dir that a server uses.
+- The entry contains a mount point. The removal would delete the files of the mounted file system.
 - A process uses a path in the entry as its working dir, executable, open file, or mapped file.
 - Another user owns the entry, or the entry is not a dir, a file, or a symbolic link.
 
-The sweep removes a symbolic link, not its target. It also removes read-only trees, for example Go module caches. It does not sweep `/` or your home dir.
+The sweep removes a symbolic link, not its target. It also removes read-only trees, for example Go module caches. It does not sweep `/` or your home dir. Just before it removes an entry, the sweep examines the change time, the mounts, and the processes again.
 
 ### Agent temp dir
 
